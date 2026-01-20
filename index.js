@@ -18,15 +18,15 @@ const log = {
     info: msg => console.log(`${colors.cyan}[i] ${msg}${colors.reset}`)
 };
 
-const delay = ms => new Promise(r => setTimeout(r, ms));
+const delay = ms => new Promise(res => setTimeout(res, ms));
 
 async function downloadImage(url) {
     return new Promise((resolve, reject) => {
         https.get(url, res => {
-            const data = [];
-            res.on('data', d => data.push(d));
+            const chunks = [];
+            res.on('data', c => chunks.push(c));
             res.on('end', () => {
-                const buffer = Buffer.concat(data);
+                const buffer = Buffer.concat(chunks);
                 resolve(`data:${res.headers['content-type']};base64,${buffer.toString('base64')}`);
             });
         }).on('error', reject);
@@ -37,115 +37,117 @@ class ServerCloner {
     constructor(client) {
         this.client = client;
         this.roleMapping = new Map();
-        this.stats = { roles: 0, categories: 0, channels: 0, emojis: 0, failed: 0 };
+        this.stats = {
+            rolesCreated: 0,
+            categoriesCreated: 0,
+            channelsCreated: 0,
+            emojisCreated: 0,
+            failed: 0
+        };
     }
 
     async cloneServer(sourceId, targetId, cloneEmojis, progressChannel) {
         const source = this.client.guilds.cache.get(sourceId);
         const target = this.client.guilds.cache.get(targetId);
 
-        if (!source || !target) throw new Error('Guild not found');
+        if (!source) throw new Error('Source server not found');
+        if (!target) throw new Error('Target server not found');
 
-        this.send('🗑️ Cleaning target server...', progressChannel);
-        await this.cleanup(target);
-
+        await this.deleteExistingContent(target, progressChannel);
         await this.cloneRoles(source, target, progressChannel);
         await this.cloneCategories(source, target, progressChannel);
         await this.cloneChannels(source, target, progressChannel);
         if (cloneEmojis) await this.cloneEmojis(source, target, progressChannel);
-        await this.cloneInfo(source, target, progressChannel);
+        await this.cloneServerInfo(source, target, progressChannel);
 
-        this.send('🎉 Cloning completed successfully!', progressChannel);
+        this.sendProgress('🎉 Server cloning completed!', progressChannel);
     }
 
-    async cleanup(guild) {
-        for (const c of guild.channels.cache.values()) if (c.deletable) await c.delete().catch(() => {});
-        for (const r of guild.roles.cache.values())
+    async deleteExistingContent(guild, progressChannel) {
+        for (const c of guild.channels.cache.values()) {
+            if (c.deletable) await c.delete().catch(() => {});
+        }
+        for (const r of guild.roles.cache.values()) {
             if (r.name !== '@everyone' && r.editable) await r.delete().catch(() => {});
+        }
     }
 
     // ✅ FIXED ROLE CLONING
-    async cloneRoles(source, target, progressChannel) {
-        this.send('👑 Cloning roles...', progressChannel);
+    async cloneRoles(sourceGuild, targetGuild, progressChannel) {
+        this.sendProgress('👑 Cloning roles...', progressChannel);
 
-        const sourceRoles = source.roles.cache
+        const sourceRoles = sourceGuild.roles.cache
             .filter(r => r.name !== '@everyone')
             .sort((a, b) => a.position - b.position); // bottom → top
 
-        const created = [];
+        const createdRoles = [];
 
-        for (const role of sourceRoles.values()) {
+        for (const [, role] of sourceRoles) {
             try {
-                const newRole = await target.roles.create({
+                const newRole = await targetGuild.roles.create({
                     name: role.name,
                     color: role.hexColor,
                     permissions: role.permissions,
                     hoist: role.hoist,
                     mentionable: role.mentionable,
-                    reason: 'Server clone'
+                    reason: 'Server cloning'
                 });
 
                 this.roleMapping.set(role.id, newRole.id);
-                created.push(newRole);
-                this.stats.roles++;
+                createdRoles.push(newRole);
+                this.stats.rolesCreated++;
 
-                this.send(`Created role: ${role.name}`, progressChannel);
+                this.sendProgress(`Created role: ${role.name}`, progressChannel);
                 await delay(200);
             } catch {
                 this.stats.failed++;
             }
         }
 
-        // ✅ ONE SAFE POSITION FIX
-        await target.roles.setPositions(
-            created.map((r, i) => ({ id: r.id, position: i + 1 }))
+        // ✅ ONE ATOMIC POSITION FIX (THIS IS THE KEY)
+        await targetGuild.roles.setPositions(
+            createdRoles.map((r, i) => ({
+                id: r.id,
+                position: i + 1
+            }))
         ).catch(() => {});
 
-        this.send('✅ Role order fixed correctly', progressChannel);
+        this.sendProgress('✅ Role order fixed correctly', progressChannel);
     }
 
-    async cloneCategories(source, target, progressChannel) {
-        for (const cat of source.channels.cache
-            .filter(c => c.type === 'GUILD_CATEGORY')
+    async cloneCategories(source, target) {
+        for (const c of source.channels.cache
+            .filter(ch => ch.type === 'GUILD_CATEGORY')
             .sort((a, b) => a.position - b.position)
             .values()) {
-            await target.channels.create(cat.name, {
-                type: 'GUILD_CATEGORY',
-                position: cat.position
-            }).catch(() => {});
-            this.stats.categories++;
+            await target.channels.create(c.name, { type: 'GUILD_CATEGORY' }).catch(() => {});
+            this.stats.categoriesCreated++;
         }
     }
 
-    async cloneChannels(source, target, progressChannel) {
-        for (const ch of source.channels.cache
-            .filter(c => c.type === 'GUILD_TEXT' || c.type === 'GUILD_VOICE')
+    async cloneChannels(source, target) {
+        for (const c of source.channels.cache
+            .filter(ch => ch.type === 'GUILD_TEXT' || ch.type === 'GUILD_VOICE')
             .sort((a, b) => a.position - b.position)
             .values()) {
-
-            const parent = ch.parent
-                ? target.channels.cache.find(c => c.name === ch.parent.name)
-                : null;
-
-            await target.channels.create(ch.name, {
-                type: ch.type,
-                parent: parent?.id,
-                topic: ch.topic,
-                nsfw: ch.nsfw,
-                bitrate: ch.bitrate,
-                userLimit: ch.userLimit
+            await target.channels.create(c.name, {
+                type: c.type,
+                parent: c.parent ? target.channels.cache.find(x => x.name === c.parent.name)?.id : null,
+                topic: c.topic,
+                nsfw: c.nsfw,
+                bitrate: c.bitrate,
+                userLimit: c.userLimit
             }).catch(() => {});
-
-            this.stats.channels++;
+            this.stats.channelsCreated++;
         }
     }
 
-    async cloneEmojis(source, target, progressChannel) {
-        for (const emoji of source.emojis.cache.values()) {
+    async cloneEmojis(source, target) {
+        for (const e of source.emojis.cache.values()) {
             try {
-                const img = await downloadImage(emoji.url);
-                await target.emojis.create(img, emoji.name);
-                this.stats.emojis++;
+                const img = await downloadImage(e.url);
+                await target.emojis.create(img, e.name);
+                this.stats.emojisCreated++;
                 await delay(2000);
             } catch {
                 this.stats.failed++;
@@ -153,7 +155,7 @@ class ServerCloner {
         }
     }
 
-    async cloneInfo(source, target) {
+    async cloneServerInfo(source, target) {
         if (source.iconURL()) {
             const icon = await downloadImage(source.iconURL({ size: 1024 }));
             await target.setIcon(icon).catch(() => {});
@@ -161,27 +163,24 @@ class ServerCloner {
         await target.setName(source.name).catch(() => {});
     }
 
-    send(msg, ch) {
+    sendProgress(msg, ch) {
         if (ch) ch.send(msg).catch(() => {});
         log.info(msg.replace(/[^\w\s]/g, ''));
     }
 }
 
 const client = new Client();
-const pending = new Map();
 
 client.on('messageCreate', async msg => {
     if (!msg.content.startsWith('!clone')) return;
 
-    const [ , sourceId, targetId ] = msg.content.split(' ');
+    const [, sourceId, targetId] = msg.content.split(' ');
     if (!sourceId || !targetId) return;
 
     msg.channel.send('Proceed? (y/n)');
-    pending.set(msg.author.id, { sourceId, targetId });
-
-    client.once('messageCreate', async reply => {
-        if (reply.author.id !== msg.author.id) return;
-        if (!['y','yes'].includes(reply.content.toLowerCase())) return;
+    client.once('messageCreate', async r1 => {
+        if (r1.author.id !== msg.author.id) return;
+        if (!['y', 'yes'].includes(r1.content.toLowerCase())) return;
 
         msg.channel.send('Clone emojis? (y/n)');
         client.once('messageCreate', async r2 => {
@@ -189,7 +188,7 @@ client.on('messageCreate', async msg => {
             await cloner.cloneServer(
                 sourceId,
                 targetId,
-                ['y','yes'].includes(r2.content.toLowerCase()),
+                ['y', 'yes'].includes(r2.content.toLowerCase()),
                 msg.channel
             );
         });
